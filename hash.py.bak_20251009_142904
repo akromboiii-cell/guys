@@ -1,0 +1,932 @@
+#!/usr/bin/env python3
+# bot.py — full working bot (aiogram 3.22.0 + Telethon)
+# Features:
+# - /start + contact sign-in (Telethon session)
+# - promo creation (/promo) by admin
+# - admin panel (/admin): list users, revoke premium, broadcast
+# - free & premium flow for forwarding
+# - groups add/remove/list per user
+# - SessionWorker using Telethon to forward messages from "Habar yozish uchun"
+# - Fix: admin revoke updates users.json and in-memory users dict (promo reset)
+
+import os
+import re
+import json
+import asyncio
+import logging
+import random
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
+
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.bot import DefaultBotProperties
+from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.filters import Command
+from aiogram.types import InputFile
+from aiogram.types import FSInputFile
+
+from telethon import TelegramClient, events, functions
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError
+
+import sqlite3
+
+# ---------- load env ----------
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GLOBAL_API_ID = int(os.getenv("API_ID", "0") or 0)
+GLOBAL_API_HASH = os.getenv("API_HASH")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+
+if not BOT_TOKEN or not GLOBAL_API_ID or not GLOBAL_API_HASH or not ADMIN_ID:
+    print("Iltimos .env ichida BOT_TOKEN, API_ID, API_HASH, ADMIN_ID ni to'ldiring.")
+    raise SystemExit(1)
+
+# ---------- config ----------
+SESSIONS_DIR = "sessions"
+DATA_DIR = "data"
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+PROMO_FILE = os.path.join(DATA_DIR, "promos.json")
+SOURCE_TITLE = "Habar yozish uchun"
+FREE_DEFAULT_MINUTES = 30
+PER_TARGET_DELAY = 2  # seconds between targets
+
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ---------- logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
+
+# ---------- persistence ----------
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        logger.exception("load_json error %s", path)
+        return default
+
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("save_json error %s", path)
+
+users: Dict[str, Dict[str, Any]] = load_json(USERS_FILE, {})
+promos: List[Dict[str, Any]] = load_json(PROMO_FILE, [])
+
+# ---------- runtime state ----------
+active_signins: Dict[int, Dict[str, Any]] = {}
+session_locks: Dict[int, asyncio.Lock] = {}
+active_workers: Dict[int, "SessionWorker"] = {}
+
+# ---------- aiogram init ----------
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
+dp = Dispatcher()
+
+# ---------- keyboards ----------
+def contact_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📞 Kontaktni yuborish", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+def main_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Forword ⏩"), KeyboardButton(text="Manage groups ⚙️")],
+            [KeyboardButton(text="/status"), KeyboardButton(text="/help")]
+        ],
+        resize_keyboard=True
+    )
+
+def simple_cancel_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Cancel ❌")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+def manage_groups_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Add group ➕"), KeyboardButton(text="Remove group ➖")],
+            [KeyboardButton(text="List groups 📋"), KeyboardButton(text="Cancel ❌")]
+        ],
+        resize_keyboard=True
+    )
+
+def forward_menu_kb(is_premium: bool):
+    if is_premium:
+        return ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Boshlash ▶️"), KeyboardButton(text="Cancel ❌")]],
+            resize_keyboard=True
+        )
+    else:
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Free Trial"), KeyboardButton(text="Premium Trial")],
+                [KeyboardButton(text="Cancel ❌")]
+            ],
+            resize_keyboard=True
+        )
+
+def admin_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Foydalanuvchilar ro'yxati"), KeyboardButton(text="Premiumni olib tashlash")],
+            [KeyboardButton(text="Broadcast (xabar yuborish)"), KeyboardButton(text="Cancel ❌")]
+        ],
+        resize_keyboard=True
+    )
+
+# ---------- helpers ----------
+def user_base(uid: int) -> str:
+    return os.path.join(SESSIONS_DIR, f"session_{uid}")
+
+def rename_bad_session(uid: int):
+    for name in os.listdir(SESSIONS_DIR):
+        if name.startswith(f"session_{uid}"):
+            src = os.path.join(SESSIONS_DIR, name)
+            dst = src + ".bad"
+            try:
+                os.rename(src, dst)
+                logger.info("Renamed locked session: %s -> %s", src, dst)
+            except Exception:
+                logger.exception("rename bad session failed for %s", src)
+
+def ensure_user_exists(uid: str):
+    if uid not in users:
+        users[uid] = {}
+        save_json(USERS_FILE, users)
+
+async def ensure_session_lock(uid: int) -> asyncio.Lock:
+    uid = int(uid)
+    if uid not in session_locks:
+        session_locks[uid] = asyncio.Lock()
+    return session_locks[uid]
+
+# ---------- SessionWorker ----------
+class SessionWorker:
+    def __init__(self, uid: int, base_path: str, api_id: int, api_hash: str):
+        self.uid = int(uid)
+        self.base = base_path
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.client = TelegramClient(self.base, self.api_id, self.api_hash)
+        self.last_msg = None
+        self.paused = False
+        self.source_id = None
+        self.repeat_task: Optional[asyncio.Task] = None
+        self.running = False
+
+    async def start(self) -> (bool, str):
+        lock = await ensure_session_lock(self.uid)
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                async with lock:
+                    await self.client.connect()
+                    if not await self.client.is_user_authorized():
+                        await self.client.disconnect()
+                        return False, "not_authorized"
+                    break
+            except Exception as e:
+                err = str(e).lower()
+                logger.exception("[%s] client connect failed (attempt %s): %s", self.uid, attempts, err)
+                if "database is locked" in err or isinstance(e, sqlite3.OperationalError):
+                    if attempts <= 3:
+                        await asyncio.sleep(attempts)
+                        continue
+                    rename_bad_session(self.uid)
+                    return False, "database_locked"
+                else:
+                    return False, "connect_error"
+
+        source = await self._ensure_source()
+        if not source:
+            try:
+                await self.client.disconnect()
+            except:
+                pass
+            return False, "source_error"
+        self.source_id = getattr(source, "id", None)
+
+        @self.client.on(events.NewMessage(outgoing=True))
+        async def outgoing(event):
+            try:
+                if getattr(event.chat, "id", None) != self.source_id:
+                    return
+                msg = event.message
+                if (not getattr(msg, "message", None) or str(msg.message).strip() == "") and not getattr(msg, "media", None):
+                    return
+                txt = (msg.message or "").strip()
+                if txt.upper() in ("STOP", "OFF") and (not msg.media) and len(txt.split()) == 1:
+                    self.paused = True
+                    logger.info("[%s] paused by STOP", self.uid)
+                    return
+                if self.paused:
+                    self.paused = False
+                    logger.info("[%s] resumed by user", self.uid)
+                self.last_msg = msg
+                logger.info("[%s] Message queued, last_msg updated", self.uid)
+                # forward now asynchronously
+                asyncio.create_task(self._forward_now(msg))
+            except Exception:
+                logger.exception("Outgoing handler error for %s", self.uid)
+
+        self.repeat_task = asyncio.create_task(self._repeater_loop())
+        self.running = True
+        logger.info("SessionWorker started for %s", self.uid)
+        return True, "started"
+
+    async def _ensure_source(self):
+        try:
+            async for d in self.client.iter_dialogs(limit=300):
+                if getattr(d, "name", None) == SOURCE_TITLE:
+                    return d.entity
+        except Exception:
+            logger.exception("iter_dialogs error")
+        try:
+            res = await self.client(functions.channels.CreateChannelRequest(
+                title=SOURCE_TITLE,
+                about="Auto forward source created by bot",
+                megagroup=True
+            ))
+            if hasattr(res, "chats") and res.chats:
+                return res.chats[0]
+        except Exception:
+            logger.exception("CreateChannelRequest error")
+        return None
+
+    async def _resolve_targets(self) -> List:
+        u = users.get(str(self.uid), {})
+        groups = u.get("groups", []) or []
+        ents = []
+        for g in groups:
+            try:
+                ent = await self.client.get_entity(g.get("id"))
+                ents.append(ent)
+            except Exception:
+                logger.exception("resolve target failed for %s", g)
+        ents = [e for e in ents if getattr(e, "id", None) != self.source_id]
+        return ents
+
+    async def _forward_now(self, msg):
+        targets = await self._resolve_targets()
+        if not targets:
+            return
+        u = users.get(str(self.uid), {})
+        plan = u.get("plan", "free")
+        if plan == "free" and len(targets) > 3:
+            random.shuffle(targets)
+            targets = targets[:3]
+        for t in targets:
+            try:
+                await self.client.forward_messages(entity=t, messages=msg)
+            except FloodWaitError as fe:
+                logger.info("[%s] FloodWait %s sec", self.uid, fe.seconds)
+                await asyncio.sleep(fe.seconds)
+                try:
+                    await self.client.forward_messages(entity=t, messages=msg)
+                except Exception:
+                    logger.exception("[%s] retry forward error", self.uid)
+            except Exception:
+                logger.exception("[%s] forward error", self.uid)
+            await asyncio.sleep(PER_TARGET_DELAY)
+        # free plan promo message appended
+        if plan == "free":
+            try:
+                me = await bot.get_me()
+                bot_username = getattr(me, "username", None)
+                if bot_username:
+                    bot_link = f"https://t.me/{bot_username}"
+                    for t in targets:
+                        try:
+                            await self.client.send_message(entity=t, message=f"Reklama: {bot_link}")
+                        except Exception:
+                            logger.exception("promo send error")
+                        await asyncio.sleep(1)
+            except Exception:
+                logger.exception("promo send failed")
+
+    async def _repeater_loop(self):
+        while True:
+            try:
+                if self.paused or not self.last_msg:
+                    await asyncio.sleep(1)
+                    continue
+                u = users.get(str(self.uid), {})
+                plan = u.get("plan", "free")
+                if plan == "premium":
+                    interval = int(u.get("interval_minutes", 1))
+                else:
+                    interval = int(u.get("interval_minutes", FREE_DEFAULT_MINUTES))
+                # sleep interval minutes
+                await asyncio.sleep(interval * 60)
+                if self.paused or not self.last_msg:
+                    continue
+                await self._forward_now(self.last_msg)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("repeater_loop err")
+                await asyncio.sleep(3)
+
+    async def stop(self):
+        try:
+            if self.repeat_task:
+                self.repeat_task.cancel()
+        except Exception:
+            pass
+        try:
+            await self.client.disconnect()
+        except Exception:
+            pass
+        self.running = False
+        logger.info("SessionWorker stopped for %s", self.uid)
+
+# ---------- worker management ----------
+async def ensure_worker_running(uid: int) -> (bool, str):
+    uid = int(uid)
+    if uid in active_workers and active_workers[uid].running:
+        return True, "already"
+    u = users.get(str(uid), {})
+    if not u.get("session"):
+        return False, "no_session"
+    base = user_base(uid)
+    sw = SessionWorker(uid, base, GLOBAL_API_ID, GLOBAL_API_HASH)
+    ok, msg = await sw.start()
+    if ok:
+        active_workers[uid] = sw
+        return True, "started"
+    else:
+        logger.info("ensure_worker_running failed for %s: %s", uid, msg)
+        return False, msg
+
+# ---------- admin pending state ----------
+admin_pending: Dict[str, Any] = {}  # mode: broadcast/revoke
+
+# ---------- handlers ----------
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    uid = str(message.from_user.id)
+    ensure_user_exists(uid)
+    u = users.get(uid, {})
+    if u.get("session"):
+        started, info = await ensure_worker_running(int(uid))
+        if started:
+            await message.answer("Siz ro'yxatdan o'tgansiz va userbot ishga tushdi.", reply_markup=main_kb())
+            return
+        else:
+            await message.answer("Session mavjud, lekin worker ishga tushmadi. Iltimos kontakt yuboring.", reply_markup=contact_kb())
+            return
+    await message.answer("Assalomu alaykum. Avtorizatsiya uchun telefon kontaktni yuboring (bir marta).", reply_markup=contact_kb())
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    # Matnli qo'llanma
+    await message.answer(
+        "Qo'llanma:\n"
+        "1) /start -> kontakt yuboring -> kodni yuboring -> userbot sessiyani yarating.\n"
+        "2) Manage groups -> Add/Remove/List.\n"
+        "3) Forword -> Free yoki Premium.\n"
+        "4) Premium: /restime <minutes> bilan intervalni sozlang.\n"
+        "5) Habar yozish uchun guruhga yozing — userbot xabarni belgilangan guruhlarga forword qiladi.\n"
+        "6) STOP yoki OFF yozsangiz takroriy yuborish to'xtaydi.",
+        reply_markup=main_kb()
+    )
+
+    # Video o'rniga kanal ssilkasi
+    channel_link = "https://t.me/foydalanish_videosi"
+    await message.answer(f"🎬 Video shu kanalga joylangan:\n{channel_link}")
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    uid = str(message.from_user.id)
+    ensure_user_exists(uid)
+    u = users.get(uid, {})
+    plan = u.get("plan", "free")
+    groups = u.get("groups", []) or []
+    interval = u.get("interval_minutes", FREE_DEFAULT_MINUTES if plan=="free" else u.get("interval_minutes", 1))
+    await message.answer(f"Status:\nPlan: {plan}\nInterval (min): {interval}\nGuruhlar soni: {len(groups)}", reply_markup=main_kb())
+
+@dp.message(Command("promo"))
+async def cmd_promo(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Bu buyruq faqat admin uchun.")
+        return
+    parts = (message.text or "").strip().split()
+    if len(parts) != 2:
+        await message.answer("Foydalanish: /promo <son>")
+        return
+    try:
+        n = int(parts[1])
+        if n <= 0 or n > 500:
+            await message.answer("Iltimos 1-500 oralig'ida son kiriting.")
+            return
+    except:
+        await message.answer("Xato format.")
+        return
+    created = []
+    for _ in range(n):
+        code = "{:04d}".format(random.randint(0, 9999))
+        while any(p['code'] == code for p in promos):
+            code = "{:04d}".format(random.randint(0, 9999))
+        p = {"code": code, "used": False, "used_by": None, "created_at": datetime.now(timezone.utc).isoformat()}
+        promos.append(p)
+        created.append(code)
+    save_json(PROMO_FILE, promos)
+    await message.answer(f"Yaratildi: {len(created)} ta promo. Kodlar:\n" + ", ".join(created))
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Bu buyruq faqat admin uchun.")
+        return
+    await message.answer("Admin panel:", reply_markup=admin_kb())
+
+@dp.message()
+async def router(message: Message):
+    text = (message.text or "").strip()
+    uid = str(message.from_user.id)
+    ensure_user_exists(uid)
+
+    # ---------- ADMIN flows ----------
+    if message.from_user.id == ADMIN_ID:
+        # list users
+        if text == "Foydalanuvchilar ro'yxati":
+            lines = []
+            for u_id, info in users.items():
+                plan = info.get("plan", "free")
+                uname = info.get("username") or ""
+                lines.append(f"{u_id} — {uname} — {plan}")
+            await message.answer("Foydalanuvchilar:\n" + ("\n".join(lines) if lines else "Hech kim yo'q"), reply_markup=admin_kb())
+            return
+
+        # revoke premium
+        if text == "Premiumni olib tashlash":
+            admin_pending['mode'] = 'revoke'
+            admin_pending['awaiting_userid'] = True
+            await message.answer("Iltimos, premiumni olib tashlamoqchi bo'lgan user id ni kiriting (raqam):", reply_markup=simple_cancel_kb())
+            return
+
+        if admin_pending.get('mode') == 'revoke' and admin_pending.get('awaiting_userid'):
+            if text == "Cancel ❌":
+                admin_pending.clear()
+                await message.answer("Bekor qilindi.", reply_markup=admin_kb())
+                return
+            try:
+                target_uid = str(int(text))
+            except:
+                await message.answer("Xato user id. Iltimos faqat raqam kiriting.")
+                return
+            if target_uid not in users:
+                await message.answer("Bunday foydalanuvchi topilmadi.", reply_markup=admin_kb())
+                admin_pending.clear()
+                return
+            # update both disk and memory: crucial fix
+            users[target_uid]['plan'] = 'free'
+            users[target_uid]['promo'] = False
+            users[target_uid].pop('last_used_promo', None)
+            save_json(USERS_FILE, users)
+            # If worker exists, it will read users dict next iteration; to be safe, update worker state
+            if int(target_uid) in active_workers:
+                # no heavy restart required; worker reads users dict periodically
+                logger.info("Updated worker state for revoked user %s", target_uid)
+            # notify user
+            try:
+                await bot.send_message(int(target_uid), "❗ Sizning premium huquqlaringiz admin tomonidan olib tashlandi. Siz endi FREE reja bilan ishlaysiz.")
+            except Exception:
+                logger.exception("notify revoke failed")
+            await message.answer(f"User {target_uid} premiumdan mahrum qilindi.", reply_markup=admin_kb())
+            admin_pending.clear()
+            return
+
+        # broadcast
+        if text == "Broadcast (xabar yuborish)":
+            admin_pending['mode'] = 'broadcast'
+            admin_pending['awaiting_broadcast'] = True
+            await message.answer("Iltimos, yuboriladigan xabarni kiriting:", reply_markup=simple_cancel_kb())
+            return
+
+        if admin_pending.get('mode') == 'broadcast' and admin_pending.get('awaiting_broadcast'):
+            if text == "Cancel ❌":
+                admin_pending.clear()
+                await message.answer("Bekor qilindi.", reply_markup=admin_kb())
+                return
+            msg_text = text
+            await message.answer("Broadcast yuborilmoqda...")
+            count = 0
+            for u_id in list(users.keys()):
+                try:
+                    await bot.send_message(int(u_id), f"📣 Admindan xabar:\n\n{msg_text}")
+                    count += 1
+                    await asyncio.sleep(0.4)
+                except Exception:
+                    logger.exception("broadcast to %s failed", u_id)
+                    await asyncio.sleep(0.2)
+            await message.answer(f"Broadcast tugadi. Yuborildi: {count} ta foydalanuvchiga.", reply_markup=admin_kb())
+            admin_pending.clear()
+            return
+
+    # admin cancel
+    if text == "Cancel ❌" and message.from_user.id == ADMIN_ID:
+        admin_pending.clear()
+        await message.answer("Bekor qilindi.", reply_markup=admin_kb())
+        return
+
+    # ---------- contact sign-in ----------
+    if message.contact:
+        phone = message.contact.phone_number
+        phone_digits = re.sub(r"\D", "", phone)
+        phone_norm = "+" + phone_digits if not phone.startswith("+") else "+" + phone_digits
+        base = user_base(int(uid))
+        client = TelegramClient(base, GLOBAL_API_ID, GLOBAL_API_HASH)
+        lock = await ensure_session_lock(int(uid))
+
+        try:
+            async with lock:
+                attempts = 0
+                while True:
+                    attempts += 1
+                    try:
+                        await client.connect()
+                        break
+                    except Exception as e:
+                        msg_err = str(e).lower()
+                        logger.exception("client.connect err attempt %s: %s", attempts, e)
+                        if "database is locked" in msg_err or isinstance(e, sqlite3.OperationalError):
+                            if attempts < 4:
+                                await asyncio.sleep(attempts)
+                                continue
+                            rename_bad_session(int(uid))
+                            await message.answer("Sessiya fayli band; zaxiraga olindi. /start orqali qayta boshlang.")
+                            try:
+                                await client.disconnect()
+                            except:
+                                pass
+                            return
+                        else:
+                            await message.answer("Serverga ulanishda xatolik. Iltimos keyinroq urin.")
+                            try:
+                                await client.disconnect()
+                            except:
+                                pass
+                            return
+
+                try:
+                    sent = await client.send_code_request(phone_norm)
+                except Exception as e:
+                    logger.exception("send_code_request failed: %s", e)
+                    await message.answer("Kod yuborishda xato (flood yoki boshqa). Iltimos biroz kutib qayta urin.")
+                    try:
+                        await client.disconnect()
+                    except:
+                        pass
+                    return
+        except Exception:
+            logger.exception("contact sign-in flow error")
+            try:
+                await client.disconnect()
+            except:
+                pass
+            await message.answer("Avtorizatsiya boshlashda xato yuz berdi.")
+            return
+
+        active_signins[int(uid)] = {'client': client, 'phone': phone_norm, 'need_password': False}
+        users[uid] = users.get(uid, {})
+        users[uid]['status'] = 'waiting_for_code'
+        save_json(USERS_FILE, users)
+        await message.answer("Kod yuborildi. Telegramdan kelgan kodni yuboring (masalan: 12.345 yoki 12345).", reply_markup=ReplyKeyboardRemove())
+        return
+
+    # ---------- handle pending sign-in ----------
+    pending = active_signins.get(int(message.from_user.id))
+    if pending:
+        client: TelegramClient = pending['client']
+        phone: str = pending['phone']
+        if pending.get('need_password'):
+            pw = (message.text or "").strip()
+            if not pw:
+                await message.answer("Iltimos 2FA parolni yuboring.")
+                return
+            try:
+                await client.sign_in(password=pw)
+            except Exception:
+                await message.answer("2FA parol noto'g'ri. Qayta yuboring yoki /reset_session bilan qayta urin.")
+                return
+        else:
+            digits = re.sub(r"\D", "", (message.text or ""))
+            if len(digits) < 4:
+                await message.answer("Kod noto'g'ri format. Iltimos Telegramdan kelgan kodni yuboring.")
+                return
+            try:
+                await client.sign_in(phone=phone, code=digits)
+            except SessionPasswordNeededError:
+                pending['need_password'] = True
+                await message.answer("2FA parol talab qilinmoqda. Iltimos parolni yuboring.")
+                return
+            except PhoneCodeInvalidError:
+                await message.answer("Kod noto'g'ri. Iltimos yangi kod oling (kontaktni qayta yuboring).")
+                return
+            except PhoneCodeExpiredError:
+                await message.answer("Kod eskirgan. Iltimos kontaktni qayta yuboring.")
+                return
+            except Exception as e:
+                logger.exception("sign_in error: %s", e)
+                await message.answer("Sign-in xatosi. Iltimos /reset_session bilan qayta urin yoki admin bilan bog'laning.")
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                active_signins.pop(int(message.from_user.id), None)
+                return
+
+        try:
+            me = await client.get_me()
+            meta = {'api_id': GLOBAL_API_ID, 'api_hash': GLOBAL_API_HASH, 'created_at': datetime.now(timezone.utc).isoformat()}
+            with open(user_base(int(message.from_user.id)) + ".meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            users[uid] = users.get(uid, {})
+            users[uid]['session'] = True
+            users[uid].pop('status', None)
+            users[uid].setdefault('plan', 'free')
+            users[uid].setdefault('groups', [])
+            users[uid].setdefault('interval_minutes', FREE_DEFAULT_MINUTES)
+            save_json(USERS_FILE, users)
+            try:
+                await client.disconnect()
+            except:
+                pass
+            active_signins.pop(int(message.from_user.id), None)
+            started, info = await ensure_worker_running(int(message.from_user.id))
+            if started:
+                await message.answer("Avtorizatsiya muvaffaqiyatli. Userbot ishga tushdi.", reply_markup=main_kb())
+            else:
+                if info == "database_locked":
+                    await message.answer("Session fayli band edi; zaxiraga olindi. Iltimos /start orqali qayta urining.", reply_markup=contact_kb())
+                elif info == "not_authorized":
+                    await message.answer("Session yaratilgan, lekin autorize bo'lmadi. Iltimos /start orqali qayta urin.", reply_markup=contact_kb())
+                else:
+                    await message.answer("Avtorizatsiya saqlandi, lekin worker ishga tushmadi: " + str(info), reply_markup=main_kb())
+        except Exception:
+            logger.exception("post-signin finalize error")
+            await message.answer("Avtorizatsiya tugagach xatolik yuz berdi. Iltimos /reset_session bilan qayta urin.")
+        return
+
+    # ---------- Manage groups ----------
+    if text == "Manage groups ⚙️":
+        await message.answer("Guruhlarni boshqarish:", reply_markup=manage_groups_kb())
+        return
+
+    if text == "Add group ➕":
+        users[uid]['await_add_group'] = True
+        save_json(USERS_FILE, users)
+        await message.answer("Guruh invite link yoki @username yuboring. (Cancel ❌ bilan chiqish)", reply_markup=simple_cancel_kb())
+        return
+
+    if text == "Remove group ➖":
+        users[uid]['await_remove_group'] = True
+        save_json(USERS_FILE, users)
+        await message.answer("O'chirmoqchi bo'lgan guruh ssilkasi yoki nomini yuboring. (Cancel ❌ bilan chiqish)", reply_markup=simple_cancel_kb())
+        return
+
+    if text == "List groups 📋":
+        groups = users.get(uid, {}).get('groups', []) or []
+        if not groups:
+            await message.answer("Ro'yxat bo'sh.", reply_markup=main_kb())
+        else:
+            lines = [f"{i+1}. {g.get('title')} (id:{g.get('id')})" for i,g in enumerate(groups)]
+            await message.answer("Sizning guruhlaringiz:\n" + "\n".join(lines), reply_markup=main_kb())
+        return
+
+    # Add group actual
+    if users.get(uid, {}).get('await_add_group'):
+        if text == "Cancel ❌":
+            users[uid].pop('await_add_group', None)
+            save_json(USERS_FILE, users)
+            await message.answer("Bekor qilindi.", reply_markup=main_kb())
+            return
+        if not users.get(uid, {}).get('session'):
+            await message.answer("Iltimos avval /start orqali avtorizatsiya qiling va userbotni ishga tushiring.", reply_markup=contact_kb())
+            users[uid].pop('await_add_group', None)
+            save_json(USERS_FILE, users)
+            return
+        started, info = await ensure_worker_running(int(uid))
+        if not started:
+            await message.answer("Worker ishlamayapti: " + str(info), reply_markup=main_kb())
+            users[uid].pop('await_add_group', None)
+            save_json(USERS_FILE, users)
+            return
+        sw = active_workers.get(int(uid))
+        try:
+            ent = await sw.client.get_entity(text)
+            gid = getattr(ent, "id", None)
+            title = getattr(ent, "title", getattr(ent, "username", str(gid)))
+            groups = users[uid].get('groups', [])
+            if any(g.get('id') == gid for g in groups):
+                await message.answer("Bu guruh allaqachon ro'yxatda.", reply_markup=main_kb())
+            else:
+                groups.append({'id': gid, 'title': title})
+                users[uid]['groups'] = groups
+                save_json(USERS_FILE, users)
+                await message.answer(f"Saqlandi ✅ — {title}", reply_markup=main_kb())
+        except Exception:
+            logger.exception("add group resolve error")
+            await message.answer("Guruhni topib bo'lmadi. Iltimos haqiqiy invite link yoki @username yuboring.", reply_markup=main_kb())
+        users[uid].pop('await_add_group', None)
+        save_json(USERS_FILE, users)
+        return
+
+    # Remove group actual
+    if users.get(uid, {}).get('await_remove_group'):
+        if text == "Cancel ❌":
+            users[uid].pop('await_remove_group', None)
+            save_json(USERS_FILE, users)
+            await message.answer("Bekor qilindi.", reply_markup=main_kb())
+            return
+        tt = text
+        groups = users[uid].get('groups', [])
+        removed = False
+        for g in list(groups):
+            if str(g.get('id')) == tt or tt.lower() in str(g.get('title','')).lower() or (tt.startswith('@') and tt.lower() == str(g.get('title','')).lower()):
+                groups.remove(g)
+                removed = True
+        if removed:
+            users[uid]['groups'] = groups
+            save_json(USERS_FILE, users)
+            await message.answer("O'chirildi ✅", reply_markup=main_kb())
+        else:
+            await message.answer("Ro'yxatda mos guruh topilmadi.", reply_markup=main_kb())
+        users[uid].pop('await_remove_group', None)
+        save_json(USERS_FILE, users)
+        return
+
+    # ---------- Forword menu ----------
+    if text == "Forword ⏩":
+        # determine current true status from users dict
+        u = users.get(uid, {})
+        is_premium = (u.get("plan") == "premium")
+        await message.answer("Forword menyusi:", reply_markup=forward_menu_kb(is_premium))
+        return
+
+    # Free Trial
+    if text == "Free Trial":
+        users[uid] = users.get(uid, {})
+        users[uid]['plan'] = 'free'
+        users[uid]['promo'] = users[uid].get('promo', False)  # keep promo flag as is
+        users[uid]['interval_minutes'] = FREE_DEFAULT_MINUTES
+        save_json(USERS_FILE, users)
+        await message.answer("✅ FREE TRIAL aktiv: 30 daqiqa, maksimal 3 guruh. Endi 'Habar yozish uchun' guruhiga yozing.", reply_markup=main_kb())
+        return
+
+    # Premium Trial -> require promo or manual buy
+    if text == "Premium Trial":
+        # ask for promo code if user doesn't already have premium
+        u = users.get(uid, {})
+        if u.get('plan') == 'premium':
+            await message.answer("Siz allaqachon premium foydalanuvisiz.", reply_markup=main_kb())
+            return
+        # set flag to await promo
+        users[uid]['awaiting_promo'] = True
+        save_json(USERS_FILE, users)
+        await message.answer("Iltimos, promo kodni yuboring yoki admin bilan bog'laning. (Cancel ❌ bilan chiqish)", reply_markup=simple_cancel_kb())
+        return
+
+    # handle promo code submission
+    if users.get(uid, {}).get('awaiting_promo'):
+        if text == "Cancel ❌":
+            users[uid].pop('awaiting_promo', None)
+            save_json(USERS_FILE, users)
+            await message.answer("Bekor qilindi.", reply_markup=main_kb())
+            return
+        code = (text or "").strip()
+        found = None
+        for p in promos:
+            if p['code'] == code:
+                found = p
+                break
+        if not found:
+            await message.answer("Promo topilmadi yoki noto'g'ri kod. Admin bilan bog'laning.", reply_markup=main_kb())
+            users[uid].pop('awaiting_promo', None)
+            save_json(USERS_FILE, users)
+            return
+        if found.get('used'):
+            await message.answer("Bu promo allaqachon ishlatilgan.", reply_markup=main_kb())
+            users[uid].pop('awaiting_promo', None)
+            save_json(USERS_FILE, users)
+            return
+        # mark promo used and grant premium
+        found['used'] = True
+        found['used_by'] = int(uid)
+        found['used_at'] = datetime.now(timezone.utc).isoformat()
+        users[uid]['plan'] = 'premium'
+        users[uid]['promo'] = True
+        users[uid]['last_used_promo'] = code
+        save_json(PROMO_FILE, promos)
+        save_json(USERS_FILE, users)
+        users[uid].pop('awaiting_promo', None)
+        # ensure worker started and interval set
+        users[uid].setdefault('interval_minutes', 1)
+        save_json(USERS_FILE, users)
+        await ensure_worker_running(int(uid))
+        await message.answer("✅ Promo qabul qilindi. Siz endi PREMIUM bo'ldingiz. /restime orqali intervalni sozlang.", reply_markup=main_kb())
+        return
+
+    # Boshlash (premium)
+    if text == "Boshlash ▶️":
+        if users.get(uid, {}).get('plan') != 'premium':
+            await message.answer("Boshlash faqat premium uchun. Premiumga o'tish uchun Premium Trialni tanlang.", reply_markup=main_kb())
+            return
+        if not users.get(uid, {}).get('interval_minutes'):
+            await message.answer("Iltimos /restime <minutes> orqali intervalni belgilang.", reply_markup=main_kb())
+            return
+        await message.answer(f"Premium aktiv: interval {users[uid]['interval_minutes']} daqiqa. Endi 'Habar yozish uchun' guruhiga yozing.", reply_markup=main_kb())
+        return
+
+    # Cancel universal
+    if text in ("Cancel ❌", "❌ Bekor qilish"):
+        for k in ['await_add_group', 'await_remove_group', 'awaiting_promo', 'awaiting_interval']:
+            users[uid].pop(k, None)
+        save_json(USERS_FILE, users)
+        await message.answer("Bekor qilindi.", reply_markup=main_kb())
+        return
+
+    # /restime handling
+    if (text.lower().startswith("/restime") or text.lower() == "restime"):
+        parts = text.split()
+        if users.get(uid, {}).get('plan') != 'premium':
+            await message.answer("Bu buyruq faqat premium foydalanuvchilar uchun.")
+            return
+        if len(parts) == 2:
+            try:
+                val = int(parts[1])
+                if val < 1:
+                    await message.answer("Interval minimal 1 daqiqa.")
+                    return
+                users[uid]['interval_minutes'] = val
+                save_json(USERS_FILE, users)
+                await ensure_worker_running(int(uid))
+                await message.answer(f"Interval yangilandi: {val} daqiqa.")
+                return
+            except Exception:
+                await message.answer("Xato format. Misol: /restime 5")
+                return
+        else:
+            users[uid]['awaiting_interval'] = True
+            save_json(USERS_FILE, users)
+            await message.answer("Iltimos interval (daqiqalarda) kiriting:", reply_markup=simple_cancel_kb())
+            return
+
+    if users.get(uid, {}).get('awaiting_interval'):
+        txt = (message.text or "").strip()
+        if txt in ("Cancel ❌",):
+            users[uid].pop('awaiting_interval', None)
+            save_json(USERS_FILE, users)
+            await message.answer("Bekor qilindi.", reply_markup=main_kb())
+            return
+        try:
+            val = int(txt)
+            if val < 1:
+                await message.answer("Interval minimal 1 daqiqa.")
+                return
+            users[uid]['interval_minutes'] = val
+            users[uid]['plan'] = 'premium'
+            users[uid].pop('awaiting_interval', None)
+            save_json(USERS_FILE, users)
+            await ensure_worker_running(int(uid))
+            await message.answer(f"Premium interval belgilandi: {val} daqiqa.", reply_markup=main_kb())
+        except Exception:
+            await message.answer("Xato format. Iltimos raqam kiriting (masalan: 5).")
+        return
+
+    # fallback
+    await message.answer("Noma'lum buyruq. /help", reply_markup=main_kb())
+
+# ---------- startup ----------
+async def on_startup():
+    logger.info("Bot starting...")
+    # start workers for existing sessions
+    for uid, u in users.items():
+        try:
+            if u.get('session'):
+                asyncio.create_task(ensure_worker_running(int(uid)))
+        except Exception:
+            logger.exception("startup worker start failed for %s", uid)
+
+if __name__ == "__main__":
+    try:
+        logger.info("Starting polling...")
+        asyncio.run(dp.start_polling(bot, on_startup=on_startup))
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
+    except Exception:
+        logger.exception("Fatal error")
