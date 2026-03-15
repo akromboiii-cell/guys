@@ -35,9 +35,9 @@ import sqlite3
 # ---------- load env ----------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7790695756:AAEemb2oRhcfeJpc5OR7v4v-pkc6qAWtQg4")
-GLOBAL_API_ID = int(os.getenv("API_ID", "25504616")
+GLOBAL_API_ID = int(os.getenv("API_ID", "25504616"))
 GLOBAL_API_HASH = os.getenv("API_HASH", "41495a370906cf32c7242e1454ba347e")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7866459528")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "7866459528"))
 
 if not BOT_TOKEN or not GLOBAL_API_ID or not GLOBAL_API_HASH or not ADMIN_ID:
     print("Iltimos .env ichida BOT_TOKEN, API_ID, API_HASH, ADMIN_ID ni to'ldiring.")
